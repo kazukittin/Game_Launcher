@@ -1,35 +1,40 @@
-
-# ------------------------------
-# ui/main_window.py
-# ------------------------------
+"""Main window for the launcher UI."""
 from __future__ import annotations
+
+import logging
 import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from models import APP_TITLE, Entry, EntryStore
-from utils.launcher import launch_path
-from utils.pixcache import PixCache
+from launcher import discovery, launch_win
+from launcher.models import APP_TITLE, Game, SettingsStore
 from ui.card import CardWidget
 from ui.dialogs import EntryDialog
+from utils.launcher import launch_path
+from utils.pixcache import PixCache
+
+LOGGER = logging.getLogger(__name__)
 
 CARD_WIDTH = 240
-MAX_COLUMNS = 6  # 最大列数
+MAX_COLUMNS = 6
+
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(1200, 800)
 
         self.base_dir = Path(sys.argv[0]).resolve().parent
-        self.store = EntryStore(self.base_dir)
+        self.store = SettingsStore(self.base_dir)
+
         self.pix_cache = PixCache()
 
         self.apply_light_style()
 
-        # ===== ヘッダー（検索・★のみ・追加）=====
+        # ----- Header -----
         self.search_edit = QtWidgets.QLineEdit()
         self.search_edit.setPlaceholderText("検索（名前/パス/タグを含む文字列検索）")
         self.search_edit.textChanged.connect(self.refresh_grid)
@@ -37,8 +42,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.only_fav_chk = QtWidgets.QCheckBox("★のみ")
         self.only_fav_chk.stateChanged.connect(self.refresh_grid)
 
-        add_btn = QtWidgets.QPushButton("追加")
-        add_btn.clicked.connect(self.add_entry)
+        add_btn = QtWidgets.QToolButton()
+        add_btn.setText("追加")
+        add_btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+        add_menu = QtWidgets.QMenu(add_btn)
+        add_menu.addAction("手動追加", self.add_entry)
+        add_menu.addAction("自動スキャン", self.auto_scan)
+        add_btn.setMenu(add_menu)
 
         top_bar = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(top_bar)
@@ -54,7 +64,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addToolBar(QtCore.Qt.TopToolBarArea, tb)
         tb.addWidget(top_bar)
 
-        # ===== グリッド =====
+        # ----- Grid -----
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setAcceptDrops(True)
@@ -72,8 +82,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setAcceptDrops(True)
         self.refresh_grid()
 
-    # ===== テーマ =====
-    def apply_light_style(self):
+    def apply_light_style(self) -> None:
         QtWidgets.QApplication.setStyle("Fusion")
         QtWidgets.QApplication.instance().setPalette(QtWidgets.QApplication.style().standardPalette())
         self.setStyleSheet(
@@ -81,89 +90,133 @@ class MainWindow(QtWidgets.QMainWindow):
             QToolBar { spacing: 8px; padding: 6px; }
             QLineEdit { padding: 8px; border-radius: 10px; }
             QCheckBox { padding: 4px; }
-            QPushButton { padding: 6px 12px; border-radius: 8px; }
+            QPushButton, QToolButton { padding: 6px 12px; border-radius: 8px; }
             """
         )
 
-    # ===== 追加ダイアログ =====
-    def add_entry(self):
+    def add_entry(self) -> None:
         dlg = EntryDialog(self)
         if dlg.exec():
-            e = dlg.get_value()
-            if e:
-                self.store.add(e)
+            game = dlg.get_value()
+            if game:
+                self.store.add(game)
                 self.refresh_grid()
 
-    # ===== D&Dで追加 =====
-    def dragEnterEvent(self, ev: QtGui.QDragEnterEvent):
+    def auto_scan(self) -> None:
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.BusyCursor)
+        try:
+            found = discovery.initial_discovery()
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.exception("Auto discovery failed: %s", exc)
+            QtWidgets.QMessageBox.critical(
+                self, APP_TITLE, "自動スキャンに失敗しました。ログを確認してください。"
+            )
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        games = discovery.merge_discovery(found)
+        new_games = []
+        for game in games:
+            if self.store.contains(game):
+                continue
+            new_games.append(game.clone(id=str(QtCore.QUuid.createUuid())))
+        added = self.store.add_many(new_games)
+        if added:
+            QtWidgets.QMessageBox.information(self, APP_TITLE, f"{added} 件のゲームを追加しました。")
+            self.refresh_grid()
+        else:
+            QtWidgets.QMessageBox.information(self, APP_TITLE, "新しいゲームは見つかりませんでした。")
+
+    def dragEnterEvent(self, ev: QtGui.QDragEnterEvent) -> None:
         if ev.mimeData().hasUrls():
             ev.acceptProposedAction()
         else:
             super().dragEnterEvent(ev)
 
-    def dropEvent(self, ev: QtGui.QDropEvent):
+    def dropEvent(self, ev: QtGui.QDropEvent) -> None:
         urls = ev.mimeData().urls()
         added = 0
         for u in urls:
             p = u.toLocalFile()
             if not p:
                 continue
-            path = Path(p)
-            if path.is_dir() or path.suffix.lower() in {".exe", ".bat", ".lnk"} or "://" in p:
-                e = Entry(
-                    id=str(QtCore.QUuid.createUuid()),
-                    name=path.stem,
-                    path=str(path),
-                    workdir=str(path.parent),
-                    tags=[],
-                    favorite=False,
-                    cover=""
-                )
-                self.store.add(e)
-                added += 1
+            if "://" in p:
+                exec_path = p
+                name = p
+                working_dir = None
+                kind = self._detect_kind(exec_path)
+            else:
+                path = Path(p)
+                if not (
+                    path.is_dir() or path.suffix.lower() in {".exe", ".bat", ".lnk"}
+                ):
+                    continue
+                exec_path = str(path)
+                name = path.stem
+                working_dir = str(path.parent)
+                kind = self._detect_kind(exec_path)
+            game = Game(
+                id=str(QtCore.QUuid.createUuid()),
+                name=name,
+                exec_path=exec_path,
+                working_dir=working_dir,
+                tags=[],
+                cover=None,
+                kind=kind,
+            )
+            self.store.add(game)
+            added += 1
         if added:
             self.refresh_grid()
         ev.acceptProposedAction()
 
-    # ===== 絞り込み（タグ条件は撤廃）=====
-    def filtered_entries(self) -> List[Entry]:
-        q = self.search_edit.text().strip().lower()
+    def _detect_kind(self, exec_path: str) -> str:
+        if exec_path.startswith("steam://"):
+            return "steam"
+        if exec_path.startswith("com.epicgames.launcher://"):
+            return "epic"
+        if exec_path.lower().endswith(".lnk"):
+            return "lnk"
+        return "exe"
+
+    def filtered_games(self) -> List[Game]:
+        query = self.search_edit.text().strip().lower()
         only_fav = self.only_fav_chk.isChecked()
-
-        out: List[Entry] = []
-        for e in self.store.entries:
-            if only_fav and not e.favorite:
+        filtered: List[Game] = []
+        for game in self.store.games:
+            if only_fav and not game.favorite:
                 continue
-            if q:
-                hay = " ".join([
-                    e.name.lower(),
-                    e.path.lower(),
-                    e.args.lower(),
-                    ",".join((e.tags or [])).lower()
-                ])
-                if q not in hay:
+            if query:
+                haystack = " ".join(
+                    [
+                        game.name.lower(),
+                        game.exec_path.lower(),
+                        (game.args or "").lower(),
+                        ",".join(game.tags).lower(),
+                    ]
+                )
+                if query not in haystack:
                     continue
-            out.append(e)
-        return out
+            filtered.append(game)
+        return filtered
 
-    # ===== グリッド更新 =====
-    def refresh_grid(self):
+    def refresh_grid(self) -> None:
         while self.grid.count():
             item = self.grid.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
 
-        width = CARD_WIDTH
-        card_size = QtCore.QSize(width, int(width * 1.5))
-        entries = self.filtered_entries()
+        card_size = QtCore.QSize(CARD_WIDTH, int(CARD_WIDTH * 1.5))
+        games = self.filtered_games()
 
         avail = max(600, self.scroll.viewport().width() - 32)
-        col = max(3, min(MAX_COLUMNS, int(avail / (card_size.width() + 24))))
+        cols = max(3, min(MAX_COLUMNS, int(avail / (card_size.width() + 24))))
 
         r = c = 0
-        for e in entries:
-            card = CardWidget(e, card_size, self.pix_cache)
+        for game in games:
+            card = CardWidget(game, card_size, self.pix_cache)
             card.clicked.connect(self.on_card_clicked)
             card.editRequested.connect(self.on_edit)
             card.deleteRequested.connect(self.on_delete)
@@ -171,63 +224,66 @@ class MainWindow(QtWidgets.QMainWindow):
             card.coverDropped.connect(self.on_cover_dropped)
             self.grid.addWidget(card, r, c)
             c += 1
-            if c >= col:
+            if c >= cols:
                 c = 0
                 r += 1
 
         self.center_w.adjustSize()
 
-    def resizeEvent(self, e: QtGui.QResizeEvent):
-        super().resizeEvent(e)
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
         QtCore.QTimer.singleShot(0, self.refresh_grid)
 
-    # ===== 操作 =====
-    def entry_by_id(self, id_: str) -> Optional[Entry]:
-        for e in self.store.entries:
-            if e.id == id_:
-                return e
-        return None
+    def entry_by_id(self, game_id: str) -> Optional[Game]:
+        return self.store.by_id(game_id)
 
-    def on_card_clicked(self, id_: str):
-        e = self.entry_by_id(id_)
-        if not e:
+    def launch_game(self, game: Game) -> bool:
+        if sys.platform.startswith("win"):
+            status = launch_win.launch(game.exec_path, args=game.args, run_as_admin=game.run_as_admin)
+            if status != 0 and game.fallback_exe:
+                LOGGER.info("Retrying %s using fallback executable", game.name)
+                status = launch_win.launch(game.fallback_exe, args=game.args, run_as_admin=game.run_as_admin)
+            return status == 0
+        return launch_path(game.exec_path, game.args or "", game.working_dir or "")
+
+    def on_card_clicked(self, game_id: str) -> None:
+        game = self.entry_by_id(game_id)
+        if not game:
             return
-        ok = launch_path(e.path, e.args, e.workdir)
-        if not ok:
+        if not self.launch_game(game):
             QtWidgets.QMessageBox.warning(self, APP_TITLE, "起動に失敗。パス/権限を確認してね")
 
-    def on_edit(self, id_: str):
-        e = self.entry_by_id(id_)
-        if not e:
+    def on_edit(self, game_id: str) -> None:
+        game = self.entry_by_id(game_id)
+        if not game:
             return
-        dlg = EntryDialog(self, e)
+        dlg = EntryDialog(self, game)
         if dlg.exec():
-            new_e = dlg.get_value()
-            if new_e:
-                new_e.favorite = e.favorite
-                self.store.update(new_e)
+            updated = dlg.get_value()
+            if updated:
+                self.store.update(updated)
                 self.refresh_grid()
 
-    def on_delete(self, id_: str):
-        e = self.entry_by_id(id_)
-        if not e:
+    def on_delete(self, game_id: str) -> None:
+        game = self.entry_by_id(game_id)
+        if not game:
             return
-        if QtWidgets.QMessageBox.question(self, APP_TITLE, f"『{e.name}』を削除する？") == QtWidgets.QMessageBox.Yes:
-            self.store.delete([e.id])
+        if QtWidgets.QMessageBox.question(self, APP_TITLE, f"『{game.name}』を削除する？") == QtWidgets.QMessageBox.Yes:
+            self.store.delete([game.id])
             self.refresh_grid()
 
-    def on_fav(self, id_: str):
-        e = self.entry_by_id(id_)
-        if not e:
+    def on_fav(self, game_id: str) -> None:
+        game = self.entry_by_id(game_id)
+        if not game:
             return
-        e.favorite = not e.favorite
-        self.store.update(e)
+        game.favorite = not game.favorite
+        self.store.update(game)
         self.refresh_grid()
 
-    def on_cover_dropped(self, id_: str, img_path: str):
-        e = self.entry_by_id(id_)
-        if not e:
+    def on_cover_dropped(self, game_id: str, img_path: str) -> None:
+        game = self.entry_by_id(game_id)
+        if not game:
             return
-        e.cover = img_path
-        self.store.update(e)
+        game.cover = img_path
+        self.store.update(game)
         self.refresh_grid()

@@ -5,6 +5,8 @@
 from __future__ import annotations
 from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from launcher.models import Game
 from utils.pixcache import PixCache
 
 class CardWidget(QtWidgets.QFrame):
@@ -14,9 +16,9 @@ class CardWidget(QtWidgets.QFrame):
     favToggled = QtCore.Signal(str)
     coverDropped = QtCore.Signal(str, str)
 
-    def __init__(self, entry, size: QtCore.QSize, pix_cache: PixCache):
+    def __init__(self, entry: Game, size: QtCore.QSize, pix_cache: PixCache):
         super().__init__()
-        self.entry = entry
+        self.entry: Game = entry
         self.cardSize = size
         self.pix_cache = pix_cache
         self.setObjectName("card")
